@@ -1,0 +1,929 @@
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional
+import os
+import secrets
+import smtplib
+from email.mime.text import MIMEText
+
+from fastapi import FastAPI, Depends, HTTPException, Header, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    DateTime,
+    ForeignKey,
+    UniqueConstraint,
+    CheckConstraint,
+)
+from sqlalchemy.orm import (
+    sessionmaker,
+    declarative_base,
+    relationship,
+    Session,
+    joinedload,
+)
+from passlib.hash import pbkdf2_sha256
+from dotenv import load_dotenv
+
+# -----------------------------------
+# Config
+# -----------------------------------
+load_dotenv()
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg2://bolao_user:bolao_password@localhost:5433/bolao2026",
+)
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173")
+
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_FROM = os.getenv("SMTP_FROM")
+
+origins = ["*"]
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+app = FastAPI(title="Bolão Copa 2026")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -----------------------------------
+# Models
+# -----------------------------------
+
+
+class User(Base):
+  __tablename__ = "users"
+
+  id = Column(Integer, primary_key=True, index=True)
+  name = Column(String, nullable=False)
+  email = Column(String, unique=True, index=True, nullable=False)
+  password_hash = Column(String, nullable=False)
+  auth_token = Column(String, unique=True, nullable=True)
+  reset_token = Column(String, unique=True, nullable=True)
+  reset_token_expires_at = Column(DateTime(timezone=True), nullable=True)
+  created_at = Column(
+      DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+  )
+
+  profile = Column(String, nullable=False, default="user")
+
+  bets = relationship("Bet", back_populates="user")
+
+
+class Team(Base):
+  __tablename__ = "teams"
+
+  id = Column(Integer, primary_key=True, index=True)
+  name = Column(String, nullable=False)
+  fifa_code = Column(String, nullable=False)
+  group = Column(String, nullable=False)
+
+
+class Match(Base):
+  __tablename__ = "matches"
+
+  id = Column(Integer, primary_key=True, index=True)
+  home_team_id = Column(Integer, ForeignKey("teams.id"), nullable=False)
+  away_team_id = Column(Integer, ForeignKey("teams.id"), nullable=False)
+  stage = Column(String, nullable=False)
+  kickoff_at_utc = Column(DateTime(timezone=True), nullable=False)
+  home_score = Column(Integer, nullable=True)
+  away_score = Column(Integer, nullable=True)
+
+  home_team = relationship("Team", foreign_keys=[home_team_id])
+  away_team = relationship("Team", foreign_keys=[away_team_id])
+  bets = relationship("Bet", back_populates="match")
+
+
+class Bet(Base):
+  __tablename__ = "bets"
+  __table_args__ = (
+      UniqueConstraint("user_id", "match_id", name="uix_user_match"),
+  )
+
+  id = Column(Integer, primary_key=True, index=True)
+  user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+  match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
+  home_score_prediction = Column(Integer, nullable=False)
+  away_score_prediction = Column(Integer, nullable=False)
+  created_at = Column(
+      DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+  )
+  updated_at = Column(
+      DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+  )
+
+  user = relationship("User", back_populates="bets")
+  match = relationship("Match", back_populates="bets")
+
+
+class BetHistory(Base):
+  __tablename__ = "bet_history"
+  __table_args__ = (
+      CheckConstraint(
+          "action_type IN ('insert', 'update')",
+          name="ck_bet_history_action_type",
+      ),
+  )
+
+  id = Column(Integer, primary_key=True, index=True)
+
+  user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+  user_name = Column(String, nullable=False)
+
+  match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
+
+  home_score_prediction = Column(Integer, nullable=True)
+  away_score_prediction = Column(Integer, nullable=True)
+
+  prev_home_score_prediction = Column(Integer, nullable=True)
+  prev_away_score_prediction = Column(Integer, nullable=True)
+
+  action_type = Column(String, nullable=False)  # 'insert' ou 'update'
+
+  changed_at_utc = Column(
+      DateTime(timezone=True),
+      nullable=False,
+      default=lambda: datetime.now(timezone.utc),
+  )
+
+  user = relationship("User")
+  match = relationship("Match")
+
+
+# Garante que as tabelas existam
+Base.metadata.create_all(bind=engine)
+
+# -----------------------------------
+# Utils / Auth helpers
+# -----------------------------------
+
+
+def get_db():
+  db = SessionLocal()
+  try:
+      yield db
+  finally:
+      db.close()
+
+
+def hash_password(password: str) -> str:
+  return pbkdf2_sha256.hash(password)
+
+
+def verify_password(plain_password: str, password_hash: str) -> bool:
+  return pbkdf2_sha256.verify(plain_password, password_hash)
+
+
+def generate_auth_token() -> str:
+  return secrets.token_urlsafe(32)
+
+
+def send_reset_email(to_email: str, reset_link: str):
+  subject = "Bolão Copa 2026 - Reset de senha"
+  body = f"""
+Olá,
+
+Você solicitou a redefinição de senha do seu usuário no Bolão da Copa 2026.
+
+Clique no link abaixo para definir uma nova senha (válido por 1 hora):
+
+{reset_link}
+
+Se você não solicitou isso, pode ignorar este email.
+
+Abraços,
+Bolão Copa 2026
+"""
+
+  if not (SMTP_HOST and SMTP_USER and SMTP_PASS and SMTP_FROM):
+      print("==== RESET DE SENHA (DEV) ====")
+      print(f"Para: {to_email}")
+      print(f"Link: {reset_link}")
+      print("==============================")
+      return
+
+  msg = MIMEText(body, "plain", "utf-8")
+  msg["Subject"] = subject
+  msg["From"] = SMTP_FROM
+  msg["To"] = to_email
+
+  with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+      server.starttls()
+      server.login(SMTP_USER, SMTP_PASS)
+      server.send_message(msg)
+
+
+def get_current_user(
+  db: Session = Depends(get_db),
+  x_user_id: Optional[int] = Header(None, alias="X-User-Id"),
+  x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
+):
+  if x_user_id is None or x_auth_token is None:
+      raise HTTPException(status_code=401, detail="Não autenticado")
+
+  user = (
+      db.query(User)
+      .filter(User.id == x_user_id, User.auth_token == x_auth_token)
+      .first()
+  )
+  if not user:
+      raise HTTPException(status_code=401, detail="Sessão inválida")
+  return user
+
+
+# -----------------------------------
+# Schemas (Pydantic)
+# -----------------------------------
+
+
+class UserRegister(BaseModel):
+  name: str
+  email: EmailStr
+  password: str
+
+
+class UserLogin(BaseModel):
+  email: EmailStr
+  password: str
+
+
+class UserAuthOut(BaseModel):
+  id: int
+  name: str
+  email: EmailStr
+  auth_token: str
+  profile: str
+
+  class Config:
+      orm_mode = True
+
+
+class BetInfo(BaseModel):
+  home_score_prediction: int
+  away_score_prediction: int
+
+  class Config:
+      orm_mode = True
+
+
+class MatchOut(BaseModel):
+  id: int
+  stage: str
+  kickoff_at_utc: datetime
+  home_team_name: str
+  home_team_code: str
+  away_team_name: str
+  away_team_code: str
+  home_score: Optional[int]
+  away_score: Optional[int]
+  is_locked: bool
+  round: str
+  my_bet: Optional[BetInfo] = None
+
+  class Config:
+      orm_mode = True
+
+
+class BetCreate(BaseModel):
+  match_id: int
+  home_score_prediction: int
+  away_score_prediction: int
+
+
+class BetBulkCreate(BaseModel):
+  bets: List[BetCreate]
+
+
+class BetOut(BaseModel):
+  id: int
+  match_id: int
+  user_id: int
+  home_score_prediction: int
+  away_score_prediction: int
+
+  class Config:
+      orm_mode = True
+
+
+class RankingItem(BaseModel):
+  user_id: int
+  user_name: str
+  total_points: int
+
+
+class ResetPasswordRequest(BaseModel):
+  email: EmailStr
+
+
+class ResetPasswordPayload(BaseModel):
+  token: str
+  new_password: str
+
+
+class PublicBetOut(BaseModel):
+  match_id: int
+  user_id: int
+  user_name: str
+  home_score_prediction: int
+  away_score_prediction: int
+
+  class Config:
+      orm_mode = True
+
+
+class MatchResultUpdate(BaseModel):
+    match_id: int
+    home_score: int
+    away_score: int
+
+
+class MatchResultBulkUpdate(BaseModel):
+    results: List[MatchResultUpdate]
+
+class BetHistoryOut(BaseModel):
+  id: int
+  user_id: int
+  user_name: str
+
+  match_id: int
+  match_stage: Optional[str] = None
+  kickoff_at_utc: Optional[datetime] = None
+  home_team_name: Optional[str] = None
+  away_team_name: Optional[str] = None
+
+  home_score_prediction: Optional[int] = None
+  away_score_prediction: Optional[int] = None
+  prev_home_score_prediction: Optional[int] = None
+  prev_away_score_prediction: Optional[int] = None
+
+  action_type: str
+  changed_at_utc: datetime
+
+  class Config:
+      orm_mode = True
+
+
+# -----------------------------------
+# Regras de pontuação
+# -----------------------------------
+
+POINT_EXACT = 18
+POINT_RESULT_AND_ONE_SCORE = 12
+POINT_RESULT_ONLY = 9
+POINT_WRONG_RESULT_ONE_SCORE = 6
+POINT_PREDICTED_DRAW_ACTUAL_WIN = 3
+
+
+def calculate_points_for_bet(match: Match, bet: Bet) -> int:
+  if match.home_score is None or match.away_score is None:
+      return 0
+
+  real_h = match.home_score
+  real_a = match.away_score
+  pred_h = bet.home_score_prediction
+  pred_a = bet.away_score_prediction
+
+  if real_h == pred_h and real_a == pred_a:
+      return POINT_EXACT
+
+  real_result = (real_h > real_a) - (real_h < real_a)
+  pred_result = (pred_h > pred_a) - (pred_h < pred_a)
+
+  if pred_result == 0 and real_result != 0:
+      return POINT_PREDICTED_DRAW_ACTUAL_WIN
+
+  correct_scores_count = int(real_h == pred_h) + int(real_a == pred_a)
+
+  if real_result == pred_result:
+      if correct_scores_count == 1:
+          return POINT_RESULT_AND_ONE_SCORE
+      elif correct_scores_count == 0:
+          return POINT_RESULT_ONLY
+
+  if correct_scores_count >= 1:
+      return POINT_WRONG_RESULT_ONE_SCORE
+
+  return 0
+
+
+def is_match_locked(match: Match) -> bool:
+  now_utc = datetime.now(timezone.utc)
+  lock_time = match.kickoff_at_utc - timedelta(minutes=5)
+  return now_utc >= lock_time
+
+
+# -----------------------------------
+# Endpoints de Auth
+# -----------------------------------
+
+
+@app.post("/auth/register", response_model=UserAuthOut)
+def register_user(payload: UserRegister, db: Session = Depends(get_db)):
+  if len(payload.password) < 8:
+      raise HTTPException(
+          status_code=400, detail="Senha muito curta (mínimo 8 caracteres)."
+      )
+
+  existing = db.query(User).filter(User.email == payload.email).first()
+  if existing:
+      raise HTTPException(status_code=400, detail="Email já registrado")
+
+  user = User(
+      name=payload.name,
+      email=payload.email,
+      password_hash=hash_password(payload.password),
+      auth_token=generate_auth_token(),
+  )
+  db.add(user)
+  db.commit()
+  db.refresh(user)
+  return UserAuthOut(
+      id=user.id,
+      name=user.name,
+      email=user.email,
+      auth_token=user.auth_token,
+      profile=user.profile,
+  )
+
+
+@app.post("/auth/login", response_model=UserAuthOut)
+def login_user(payload: UserLogin, db: Session = Depends(get_db)):
+  user = db.query(User).filter(User.email == payload.email).first()
+  if not user or not verify_password(payload.password, user.password_hash):
+      raise HTTPException(status_code=401, detail="Email ou senha inválidos")
+
+  if not user.auth_token:
+      user.auth_token = generate_auth_token()
+      db.commit()
+      db.refresh(user)
+
+  return UserAuthOut(
+      id=user.id,
+      name=user.name,
+      email=user.email,
+      auth_token=user.auth_token,
+      profile=user.profile,
+  )
+
+
+@app.post("/auth/request-password-reset")
+def request_password_reset(
+  payload: ResetPasswordRequest, db: Session = Depends(get_db)
+):
+  user = db.query(User).filter(User.email == payload.email).first()
+  if user:
+      token = secrets.token_urlsafe(32)
+      expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+      user.reset_token = token
+      user.reset_token_expires_at = expires_at
+      db.commit()
+
+      reset_link = f"{FRONTEND_BASE_URL}/reset-password?token={token}"
+      send_reset_email(user.email, reset_link)
+
+  return {
+      "message": "Se este email estiver cadastrado, você receberá um link para redefinir a senha."
+  }
+
+
+@app.post("/auth/reset-password")
+def reset_password(payload: ResetPasswordPayload, db: Session = Depends(get_db)):
+  user = db.query(User).filter(User.reset_token == payload.token).first()
+  if not user:
+      raise HTTPException(status_code=400, detail="Token inválido")
+
+  if (
+      not user.reset_token_expires_at
+      or user.reset_token_expires_at < datetime.now(timezone.utc)
+  ):
+      raise HTTPException(status_code=400, detail="Token expirado")
+
+  if len(payload.new_password) < 8:
+      raise HTTPException(
+          status_code=400, detail="Senha muito curta (mínimo 8 caracteres)."
+      )
+
+  user.password_hash = hash_password(payload.new_password)
+  user.reset_token = None
+  user.reset_token_expires_at = None
+  user.auth_token = generate_auth_token()
+  db.commit()
+
+  return {"message": "Senha redefinida com sucesso. Faça login novamente."}
+
+
+# -----------------------------------
+# Endpoints Matches / Bets / Ranking
+# -----------------------------------
+
+
+@app.get("/matches", response_model=List[MatchOut])
+def list_matches(
+  db: Session = Depends(get_db),
+  current_user: User = Depends(get_current_user),
+):
+  matches = db.query(Match).order_by(Match.kickoff_at_utc).all()
+
+  groups = {}
+  for m in matches:
+    stage_lower = (m.stage or "").lower()
+    if stage_lower.startswith("group") or stage_lower.startswith("grupo"):
+        groups.setdefault(m.stage, []).append(m)
+
+  match_round_map = {}
+  for group_stage, group_matches in groups.items():
+      group_matches.sort(key=lambda x: x.kickoff_at_utc)
+      for idx, m in enumerate(group_matches):
+          if idx < 2:
+              r = "1a rodada"
+          elif idx < 4:
+              r = "2a rodada"
+          else:
+              r = "3a rodada"
+          match_round_map[m.id] = r
+
+  def infer_round_for_knockout(m: Match) -> str:
+      s = (m.stage or "").lower()
+      if m.id in match_round_map:
+          return match_round_map[m.id]
+
+      if "16 avos" in s or "32" in s:
+          return "16 avos"
+      if "oitavas" in s or "round of 16" in s:
+          return "oitavas"
+      if "quartas" in s or "quarter" in s:
+          return "quartas"
+      if "semi" in s:
+          return "semi"
+      if "3o" in s or "3º" in s or "third" in s:
+          return "finais"
+      if "final" in s:
+          return "finais"
+      return "1a rodada"
+
+  result: List[MatchOut] = []
+
+  for m in matches:
+      bet = (
+          db.query(Bet)
+          .filter(Bet.match_id == m.id, Bet.user_id == current_user.id)
+          .first()
+      )
+
+      round_label = match_round_map.get(m.id) or infer_round_for_knockout(m)
+
+      result.append(
+          MatchOut(
+              id=m.id,
+              stage=m.stage,
+              kickoff_at_utc=m.kickoff_at_utc,
+              home_team_name=m.home_team.name,
+              home_team_code=m.home_team.fifa_code,
+              away_team_name=m.away_team.name,
+              away_team_code=m.away_team.fifa_code,
+              home_score=m.home_score,
+              away_score=m.away_score,
+              is_locked=is_match_locked(m),
+              round=round_label,
+              my_bet=BetInfo(
+                  home_score_prediction=bet.home_score_prediction,
+                  away_score_prediction=bet.away_score_prediction,
+              )
+              if bet
+              else None,
+          )
+      )
+  return result
+
+
+@app.post("/bets", response_model=BetOut)
+def upsert_bet(
+  bet_in: BetCreate,
+  db: Session = Depends(get_db),
+  current_user: User = Depends(get_current_user),
+):
+  match = db.query(Match).filter(Match.id == bet_in.match_id).first()
+  if not match:
+      raise HTTPException(status_code=404, detail="Partida não encontrada")
+
+  if is_match_locked(match):
+      raise HTTPException(
+          status_code=400,
+          detail="Palpites só podem ser alterados até 5 minutos antes do início da partida (horário UTC).",
+      )
+
+  bet = (
+      db.query(Bet)
+      .filter(Bet.user_id == current_user.id, Bet.match_id == bet_in.match_id)
+      .first()
+  )
+  now = datetime.now(timezone.utc)
+
+  if bet is None:
+      bet = Bet(
+          user_id=current_user.id,
+          match_id=bet_in.match_id,
+          home_score_prediction=bet_in.home_score_prediction,
+          away_score_prediction=bet_in.away_score_prediction,
+          created_at=now,
+          updated_at=now,
+      )
+      db.add(bet)
+
+      history = BetHistory(
+          user_id=current_user.id,
+          user_name=current_user.name,
+          match_id=bet_in.match_id,
+          home_score_prediction=bet_in.home_score_prediction,
+          away_score_prediction=bet_in.away_score_prediction,
+          prev_home_score_prediction=None,
+          prev_away_score_prediction=None,
+          action_type="insert",
+          changed_at_utc=now,
+      )
+      db.add(history)
+  else:
+      prev_home = bet.home_score_prediction
+      prev_away = bet.away_score_prediction
+
+      bet.home_score_prediction = bet_in.home_score_prediction
+      bet.away_score_prediction = bet_in.away_score_prediction
+      bet.updated_at = now
+
+      if (
+          prev_home != bet.home_score_prediction
+          or prev_away != bet.away_score_prediction
+      ):
+          history = BetHistory(
+              user_id=current_user.id,
+              user_name=current_user.name,
+              match_id=bet_in.match_id,
+              home_score_prediction=bet.home_score_prediction,
+              away_score_prediction=bet.away_score_prediction,
+              prev_home_score_prediction=prev_home,
+              prev_away_score_prediction=prev_away,
+              action_type="update",
+              changed_at_utc=now,
+          )
+          db.add(history)
+
+  db.commit()
+  db.refresh(bet)
+  return bet
+
+
+@app.post("/bets/bulk")
+def upsert_bets_bulk(
+  payload: BetBulkCreate,
+  db: Session = Depends(get_db),
+  current_user: User = Depends(get_current_user),
+):
+  now = datetime.now(timezone.utc)
+  saved = 0
+  errors: List[str] = []
+
+  for bet_in in payload.bets:
+      match = db.query(Match).filter(Match.id == bet_in.match_id).first()
+      if not match:
+          errors.append(f"Partida {bet_in.match_id} não encontrada.")
+          continue
+
+      if is_match_locked(match):
+          errors.append(
+              f"Partida {match.id} entre {match.home_team.name} x {match.away_team.name} já está bloqueada."
+          )
+          continue
+
+      bet = (
+          db.query(Bet)
+          .filter(Bet.user_id == current_user.id, Bet.match_id == bet_in.match_id)
+          .first()
+      )
+
+      if bet is None:
+          bet = Bet(
+              user_id=current_user.id,
+              match_id=bet_in.match_id,
+              home_score_prediction=bet_in.home_score_prediction,
+              away_score_prediction=bet_in.away_score_prediction,
+              created_at=now,
+              updated_at=now,
+          )
+          db.add(bet)
+
+          history = BetHistory(
+              user_id=current_user.id,
+              user_name=current_user.name,
+              match_id=bet_in.match_id,
+              home_score_prediction=bet_in.home_score_prediction,
+              away_score_prediction=bet_in.away_score_prediction,
+              prev_home_score_prediction=None,
+              prev_away_score_prediction=None,
+              action_type="insert",
+              changed_at_utc=now,
+          )
+          db.add(history)
+      else:
+          prev_home = bet.home_score_prediction
+          prev_away = bet.away_score_prediction
+
+          bet.home_score_prediction = bet_in.home_score_prediction
+          bet.away_score_prediction = bet_in.away_score_prediction
+          bet.updated_at = now
+
+          if (
+              prev_home != bet.home_score_prediction
+              or prev_away != bet.away_score_prediction
+          ):
+              history = BetHistory(
+                  user_id=current_user.id,
+                  user_name=current_user.name,
+                  match_id=bet_in.match_id,
+                  home_score_prediction=bet.home_score_prediction,
+                  away_score_prediction=bet.away_score_prediction,
+                  prev_home_score_prediction=prev_home,
+                  prev_away_score_prediction=prev_away,
+                  action_type="update",
+                  changed_at_utc=now,
+              )
+              db.add(history)
+
+      saved += 1
+
+  db.commit()
+
+  status = "ok" if not errors else "partial"
+  return {
+      "status": status,
+      "saved": saved,
+      "errors": errors,
+  }
+
+
+@app.get("/ranking", response_model=List[RankingItem])
+def get_ranking(db: Session = Depends(get_db)):
+  users = db.query(User).all()
+  matches = db.query(Match).all()
+  matches_dict = {m.id: m for m in matches}
+  bets = db.query(Bet).all()
+
+  points_by_user = {u.id: 0 for u in users}
+
+  for bet in bets:
+      match = matches_dict.get(bet.match_id)
+      if match:
+          points_by_user[bet.user_id] += calculate_points_for_bet(match, bet)
+
+  ranking = [
+      RankingItem(
+          user_id=u.id,
+          user_name=u.name,
+          total_points=points_by_user.get(u.id, 0),
+      )
+      for u in users
+  ]
+  ranking.sort(key=lambda r: r.total_points, reverse=True)
+  return ranking
+
+
+@app.get("/bets/public", response_model=List[PublicBetOut])
+def list_public_bets(
+  db: Session = Depends(get_db),
+  current_user: User = Depends(get_current_user),
+):
+  matches = db.query(Match).all()
+  matches_dict = {m.id: m for m in matches}
+  bets = db.query(Bet).all()
+
+  result: List[PublicBetOut] = []
+
+  for bet in bets:
+      match = matches_dict.get(bet.match_id)
+      if not match:
+          continue
+
+      if not is_match_locked(match):
+          continue
+
+      result.append(
+          PublicBetOut(
+              match_id=bet.match_id,
+              user_id=bet.user_id,
+              user_name=bet.user.name,
+              home_score_prediction=bet.home_score_prediction,
+              away_score_prediction=bet.away_score_prediction,
+          )
+      )
+
+  return result
+
+@app.post("/matches/results/bulk")
+def update_match_results_bulk(
+    payload: MatchResultBulkUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # só admin pode postar resultado
+    if current_user.profile != "admin":
+        raise HTTPException(status_code=403, detail="Apenas administradores podem postar resultados oficiais.")
+
+    updated = 0
+    errors = []
+
+    for item in payload.results:
+        match = db.query(Match).filter(Match.id == item.match_id).first()
+        if not match:
+            errors.append(f"Partida {item.match_id} não encontrada.")
+            continue
+
+        # validações simples
+        if item.home_score < 0 or item.away_score < 0:
+            errors.append(f"Placar inválido para partida {item.match_id}.")
+            continue
+
+        match.home_score = item.home_score
+        match.away_score = item.away_score
+        updated += 1
+
+    db.commit()
+
+    return {
+        "status": "ok" if not errors else "partial",
+        "updated": updated,
+        "errors": errors,
+    }
+
+
+
+# -----------------------------------
+# Endpoint admin – histórico de apostas
+# -----------------------------------
+
+
+@app.get("/admin/bet-history", response_model=List[BetHistoryOut])
+def list_bet_history(
+  user_id: Optional[int] = Query(None),
+  match_id: Optional[int] = Query(None),
+  limit: int = Query(300, ge=1, le=2000),
+  db: Session = Depends(get_db),
+  current_user: User = Depends(get_current_user),
+):
+  # apenas admin
+  if current_user.profile != "admin":
+      raise HTTPException(status_code=403, detail="Apenas admins podem ver o histórico")
+
+  q = (
+      db.query(BetHistory)
+      .options(
+          joinedload(BetHistory.match).joinedload(Match.home_team),
+          joinedload(BetHistory.match).joinedload(Match.away_team),
+      )
+      .order_by(BetHistory.changed_at_utc.desc())
+  )
+
+  if user_id is not None:
+      q = q.filter(BetHistory.user_id == user_id)
+  if match_id is not None:
+      q = q.filter(BetHistory.match_id == match_id)
+
+  rows = q.limit(limit).all()
+
+  result: List[BetHistoryOut] = []
+  for h in rows:
+      m = h.match
+      result.append(
+          BetHistoryOut(
+              id=h.id,
+              user_id=h.user_id,
+              user_name=h.user_name,
+              match_id=h.match_id,
+              match_stage=m.stage if m else None,
+              kickoff_at_utc=m.kickoff_at_utc if m else None,
+              home_team_name=m.home_team.name if m and m.home_team else None,
+              away_team_name=m.away_team.name if m and m.away_team else None,
+              home_score_prediction=h.home_score_prediction,
+              away_score_prediction=h.away_score_prediction,
+              prev_home_score_prediction=h.prev_home_score_prediction,
+              prev_away_score_prediction=h.prev_away_score_prediction,
+              action_type=h.action_type,
+              changed_at_utc=h.changed_at_utc,
+          )
+      )
+
+  return result
