@@ -870,60 +870,59 @@ def update_match_results_bulk(
     }
 
 
-
 # -----------------------------------
 # Endpoint admin – histórico de apostas
 # -----------------------------------
 
-
 @app.get("/admin/bet-history", response_model=List[BetHistoryOut])
 def list_bet_history(
-  user_id: Optional[int] = Query(None),
-  match_id: Optional[int] = Query(None),
-  limit: int = Query(300, ge=1, le=2000),
-  db: Session = Depends(get_db),
-  current_user: User = Depends(get_current_user),
+    user_id: Optional[int] = Query(None),
+    match_id: Optional[int] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=200000),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-  # apenas admin
-  if current_user.profile != "admin":
-      raise HTTPException(status_code=403, detail="Apenas admins podem ver o histórico")
+    if current_user.profile != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admins podem ver o histórico")
 
-  q = (
-      db.query(BetHistory)
-      .options(
-          joinedload(BetHistory.match).joinedload(Match.home_team),
-          joinedload(BetHistory.match).joinedload(Match.away_team),
-      )
-      .order_by(BetHistory.changed_at_utc.desc())
-  )
+    q = (
+        db.query(BetHistory)
+        .options(
+            joinedload(BetHistory.match).joinedload(Match.home_team),
+            joinedload(BetHistory.match).joinedload(Match.away_team),
+        )
+        .order_by(BetHistory.changed_at_utc.desc())
+    )
 
-  if user_id is not None:
-      q = q.filter(BetHistory.user_id == user_id)
-  if match_id is not None:
-      q = q.filter(BetHistory.match_id == match_id)
+    if user_id is not None:
+        q = q.filter(BetHistory.user_id == user_id)
+    if match_id is not None:
+        q = q.filter(BetHistory.match_id == match_id)
 
-  rows = q.limit(limit).all()
+    if limit is not None:
+        q = q.limit(limit)
 
-  result: List[BetHistoryOut] = []
-  for h in rows:
-      m = h.match
-      result.append(
-          BetHistoryOut(
-              id=h.id,
-              user_id=h.user_id,
-              user_name=h.user_name,
-              match_id=h.match_id,
-              match_stage=m.stage if m else None,
-              kickoff_at_utc=m.kickoff_at_utc if m else None,
-              home_team_name=m.home_team.name if m and m.home_team else None,
-              away_team_name=m.away_team.name if m and m.away_team else None,
-              home_score_prediction=h.home_score_prediction,
-              away_score_prediction=h.away_score_prediction,
-              prev_home_score_prediction=h.prev_home_score_prediction,
-              prev_away_score_prediction=h.prev_away_score_prediction,
-              action_type=h.action_type,
-              changed_at_utc=h.changed_at_utc,
-          )
-      )
+    rows = q.all()
 
-  return result
+    result: List[BetHistoryOut] = []
+    for h in rows:
+        m = h.match
+        result.append(
+            BetHistoryOut(
+                id=h.id,
+                user_id=h.user_id,
+                user_name=h.user_name,
+                match_id=h.match_id,
+                match_stage=m.stage if m else None,
+                kickoff_at_utc=m.kickoff_at_utc if m else None,
+                home_team_name=m.home_team.name if m and m.home_team else None,
+                away_team_name=m.away_team.name if m and m.away_team else None,
+                home_score_prediction=h.home_score_prediction,
+                away_score_prediction=h.away_score_prediction,
+                prev_home_score_prediction=h.prev_home_score_prediction,
+                prev_away_score_prediction=h.prev_away_score_prediction,
+                action_type=h.action_type,
+                changed_at_utc=h.changed_at_utc,
+            )
+        )
+    return result
