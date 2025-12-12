@@ -47,7 +47,14 @@ SMTP_FROM = os.getenv("SMTP_FROM")
 
 origins = ["*"]
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=2,
+    max_overflow=0,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -164,10 +171,6 @@ class BetHistory(Base):
 
   user = relationship("User")
   match = relationship("Match")
-
-
-# Garante que as tabelas existam
-Base.metadata.create_all(bind=engine)
 
 # -----------------------------------
 # Utils / Auth helpers
