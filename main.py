@@ -8,6 +8,7 @@ from email.mime.text import MIMEText
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
+from sqlalchemy.pool import NullPool
 
 from sqlalchemy import (
     create_engine,
@@ -18,6 +19,7 @@ from sqlalchemy import (
     ForeignKey,
     UniqueConstraint,
     CheckConstraint,
+    NullPool,
 )
 from sqlalchemy.orm import (
     sessionmaker,
@@ -53,12 +55,15 @@ origins = ["*"]
 # IMPORTANT:
 # - NullPool evita problemas em ambientes tipo Render + Supabase pooler/session mode
 # - pool_pre_ping evita conexões "mortas"
+
+
 engine = create_engine(
     DATABASE_URL,
-    poolclass=NullPool,
+    poolclass=NullPool,      # ✅ aqui
     pool_pre_ping=True,
-    pool_recycle=1800,
 )
+
+
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -891,9 +896,8 @@ def update_match_results_bulk(
 
 @app.get("/admin/bet-history", response_model=List[BetHistoryOut])
 def list_bet_history(
-    user_id: Optional[int] = Query(None),
+    user_id: int = Query(..., ge=1),
     match_id: Optional[int] = Query(None),
-    limit: Optional[int] = Query(None, ge=1, le=200000),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -906,16 +910,12 @@ def list_bet_history(
             joinedload(BetHistory.match).joinedload(Match.home_team),
             joinedload(BetHistory.match).joinedload(Match.away_team),
         )
+        .filter(BetHistory.user_id == user_id)
         .order_by(BetHistory.changed_at_utc.desc())
     )
 
-    if user_id is not None:
-        q = q.filter(BetHistory.user_id == user_id)
     if match_id is not None:
         q = q.filter(BetHistory.match_id == match_id)
-
-    if limit is not None:
-        q = q.limit(limit)
 
     rows = q.all()
 
@@ -941,3 +941,48 @@ def list_bet_history(
             )
         )
     return result
+
+@app.get("/admin/users")
+def list_users(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.profile != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admins")
+
+    users = (
+        db.query(User.id, User.name)
+        .order_by(User.name.asc())
+        .all()
+    )
+
+    return [{"id": u.id, "name": u.name} for u in users]
+
+
+@app.get("/admin/matches")
+def list_matches_admin(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.profile != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admins")
+
+    matches = (
+        db.query(Match)
+        .options(
+            joinedload(Match.home_team),
+            joinedload(Match.away_team),
+        )
+        .order_by(Match.kickoff_at_utc)
+        .all()
+    )
+
+    return [
+        {
+            "id": m.id,
+            "label": f"{m.home_team.name} x {m.away_team.name}",
+            "stage": m.stage,
+            "kickoff_at_utc": m.kickoff_at_utc,
+        }
+        for m in matches
+    ]
